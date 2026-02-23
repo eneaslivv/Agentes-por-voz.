@@ -56,6 +56,7 @@ fn main() {
             {
                 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
 
+                // Ctrl+Win (Super) for dictation - matches wispr_client.py hotkey
                 let shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SUPER), Code::Space);
                 
                 app.global_shortcut().on_shortcut(shortcut, |app, _shortcut, _event| {

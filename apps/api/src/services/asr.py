@@ -1,7 +1,8 @@
 """
 ASR Service (Speech-to-Text)
 ============================
-Audio transcription using Deepgram (streaming) and Whisper (batch).
+Audio transcription using Whisper (primary) and Deepgram (fallback).
+Auto-detects audio format (WAV, WebM, etc.) for reliable transcription.
 """
 from typing import Optional, Dict, Any
 import structlog
@@ -14,30 +15,68 @@ from src.config import settings
 logger = structlog.get_logger()
 
 
-async def transcribe_audio(audio_data: bytes, language: str = "es") -> str:
+def detect_audio_format(audio_data: bytes) -> tuple[str, str]:
+    """
+    Detect audio format from magic bytes.
+    Returns (extension, mimetype).
+    """
+    if len(audio_data) < 4:
+        return ("wav", "audio/wav")
+
+    if audio_data[:4] == b'RIFF':
+        return ("wav", "audio/wav")
+    elif audio_data[:4] == b'\x1aE\xdf\xa3':
+        return ("webm", "audio/webm")
+    elif audio_data[:3] == b'ID3' or (len(audio_data) >= 2 and audio_data[:2] == b'\xff\xfb'):
+        return ("mp3", "audio/mpeg")
+    elif audio_data[:4] == b'fLaC':
+        return ("flac", "audio/flac")
+    elif audio_data[:4] == b'OggS':
+        return ("ogg", "audio/ogg")
+    else:
+        # Default to wav for raw PCM data
+        return ("wav", "audio/wav")
+
+
+async def transcribe_audio(audio_data: bytes, language: str = "es", delayed: bool = False) -> str:
     """
     Transcribe audio using Whisper API (batch processing).
-    
-    Good for final transcription after user stops speaking.
+
+    Auto-detects audio format (WAV, WebM, etc.) from magic bytes.
+    Falls back to Deepgram if Whisper fails.
     """
     try:
         if not settings.OPENAI_API_KEY:
-             logger.error("OPENAI_API_KEY is missing in settings")
-        
+            logger.error("OPENAI_API_KEY is missing - falling back to Deepgram")
+            return await transcribe_audio_deepgram(audio_data, language)
+
         client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
-        
+
+        # Auto-detect audio format
+        ext, mimetype = detect_audio_format(audio_data)
+        filename = f"audio.{ext}"
+
+        logger.info(
+            "Transcribing audio with Whisper",
+            bytes=len(audio_data),
+            format=ext,
+            language=language,
+        )
+
         # Create a file-like object from bytes
         audio_file = io.BytesIO(audio_data)
-        audio_file.name = "audio.webm"
-        
+        audio_file.name = filename
+
         response = await client.audio.transcriptions.create(
             model="whisper-1",
             file=audio_file,
             language=language,
         )
-        
-        return response.text
-        
+
+        transcript = response.text.strip() if response.text else ""
+        logger.info("Whisper transcription OK", transcript=transcript[:100])
+        return transcript
+
     except Exception as e:
         logger.error("Whisper transcription failed", error=str(e))
         # Fallback to Deepgram
@@ -47,46 +86,36 @@ async def transcribe_audio(audio_data: bytes, language: str = "es") -> str:
 async def transcribe_audio_deepgram(audio_data: bytes, language: str = "es") -> str:
     """
     Transcribe audio using Deepgram API.
+    Auto-detects mimetype from audio data.
     """
     logger.info("Attempting Deepgram transcription", audio_bytes=len(audio_data), language=language)
     try:
-        # Pass api_key as keyword argument to avoid positional argument mismatch
         client = DeepgramClient(api_key=settings.DEEPGRAM_API_KEY)
-        
-        # options = PrerecordedOptions(
-        #     model="nova-2",
-        #     language=language,
-        #     smart_format=True,
-        #     punctuate=True,
-        # )
-        
-        # Using dict instead of typed options to avoid import issues
+
+        # Auto-detect mimetype
+        _, mimetype = detect_audio_format(audio_data)
+
         options = {
             "model": "nova-2",
             "language": language,
             "smart_format": True,
             "punctuate": True,
         }
-        
-        # Prepare source
-        source = {"buffer": audio_data, "mimetype": "audio/webm"} # Assuming webm as default mimetype
-        
-        logger.info(f"Sending audio to Deepgram ({len(audio_data)} bytes)...")
-        
+
+        source = {"buffer": audio_data, "mimetype": mimetype}
+
+        logger.info(f"Sending audio to Deepgram ({len(audio_data)} bytes, {mimetype})")
+
         response = await client.listen.prerecorded.v("1").transcribe_file(
-            source, 
+            source,
             options,
-            timeout=30 # Add timeout to prevent hanging
+            timeout=30,
         )
-        
-        logger.info("Deepgram response received")
-        # logger.debug(f"Raw response: {response}") # Uncomment for detailed debugging
-        
-        # Extract transcript
+
         transcript = response.results.channels[0].alternatives[0].transcript
-        logger.info("Deepgram transcription successful", transcript=transcript)
+        logger.info("Deepgram transcription OK", transcript=transcript[:100])
         return transcript
-        
+
     except Exception as e:
         logger.error("Deepgram transcription failed", error=str(e))
         return ""
@@ -95,33 +124,21 @@ async def transcribe_audio_deepgram(audio_data: bytes, language: str = "es") -> 
 async def transcribe_audio_streaming(audio_chunk: bytes) -> Optional[Dict[str, Any]]:
     """
     Process an audio chunk for streaming transcription.
-    
-    Returns partial or final transcription results.
-    
-    Note: Full streaming implementation requires maintaining a Deepgram
-    live connection. This is a simplified version.
     """
     try:
-        # For streaming, we'd typically maintain a persistent connection
-        # and send chunks to it. For this MVP, we'll batch small chunks.
-        
-        # Simple implementation: transcribe each chunk
-        # In production, use Deepgram's LiveTranscription API
-        
         if len(audio_chunk) < 1000:
-            # Too small, buffer it
             return None
-        
+
         transcript = await transcribe_audio_deepgram(audio_chunk)
-        
+
         if transcript:
             return {
                 "text": transcript,
-                "is_final": True,  # In real streaming, this would be per-utterance
+                "is_final": True,
             }
-        
+
         return None
-        
+
     except Exception as e:
         logger.error("Streaming transcription error", error=str(e))
         return None

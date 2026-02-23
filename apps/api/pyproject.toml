@@ -29,6 +29,13 @@ dependencies = [
     "deepgram-sdk>=3.0.0",
     "elevenlabs>=0.2.0",
     
+    # Voice Dictation (wispr_client.py)
+    "sounddevice>=0.4.6",
+    "numpy>=1.24.0",
+    "scipy>=1.11.0",
+    "pyautogui>=0.9.54",
+    "pyperclip>=1.8.2",
+
     # Utilities
     "pydantic>=2.5.0",
     "pydantic-settings>=2.1.0",
