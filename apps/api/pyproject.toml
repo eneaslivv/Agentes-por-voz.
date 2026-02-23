@@ -35,6 +35,8 @@ dependencies = [
     "scipy>=1.11.0",
     "pyautogui>=0.9.54",
     "pyperclip>=1.8.2",
+    "pycaw>=20230407",
+    "comtypes>=1.2.0",
 
     # Utilities
     "pydantic>=2.5.0",

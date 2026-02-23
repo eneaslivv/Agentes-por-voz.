@@ -1,10 +1,11 @@
 """
 Wispr Flow - Voice Dictation
 =============================
-Press Ctrl+Space anywhere to dictate. Text auto-pastes into the active field.
+HOLD Ctrl+Space to record. Release to transcribe and auto-paste.
+System audio is muted while recording for clean capture.
 
-Uses Windows RegisterHotKey API (official, 100% reliable).
-Starts the API server automatically if not running.
+Uses Windows RegisterHotKey + GetAsyncKeyState for push-to-talk.
+Streams audio chunks to server during recording for faster response.
 
 Usage:  python wispr_client.py
 """
@@ -24,6 +25,10 @@ def check_dependencies():
         'scipy': 'scipy',
         'websockets': 'websockets',
     }
+    optional = {
+        'pycaw': 'pycaw',
+        'comtypes': 'comtypes',
+    }
     missing = []
     for module, pip_name in required.items():
         try:
@@ -39,16 +44,19 @@ def check_dependencies():
         print()
         print(f"  Paquetes faltantes: {', '.join(missing)}")
         print()
-        print("  Para instalarlos, ejecuta este comando:")
-        print()
         print(f"    pip install {' '.join(missing)}")
         print()
         print("  O ejecuta: instalar_dependencias.bat")
         print()
-        print("  ==========================================")
-        print()
         input("  Presiona Enter para salir...")
         sys.exit(1)
+
+    for module, pip_name in optional.items():
+        try:
+            __import__(module)
+        except ImportError:
+            print(f"  [!] {pip_name} no instalado - mute automatico no disponible")
+            print(f"      pip install {pip_name}")
 
 check_dependencies()
 
@@ -75,21 +83,27 @@ API_URL = "ws://localhost:8000/ws/dictation"
 API_HTTP = "http://localhost:8000/health"
 SAMPLE_RATE = 16000
 CHANNELS = 1
+CHUNK_DURATION = 0.5  # seconds per streaming chunk
 
-# Hotkey: Ctrl+Space (RegisterHotKey)
+# Hotkey: Ctrl+Space
 MOD_CONTROL = 0x0002
 MOD_NOREPEAT = 0x4000
 VK_SPACE = 0x20
+VK_CONTROL = 0x11
 HOTKEY_ID = 0xBEEF
 
 user32 = ctypes.windll.user32
+
+# GetAsyncKeyState for push-to-talk release detection
+GetAsyncKeyState = user32.GetAsyncKeyState
+GetAsyncKeyState.argtypes = [ctypes.c_int]
+GetAsyncKeyState.restype = ctypes.c_short
 
 
 # ============================================================
 # AUTO-START API SERVER
 # ============================================================
 def is_api_running():
-    """Check if the API server is already running."""
     try:
         import urllib.request
         req = urllib.request.urlopen(API_HTTP, timeout=2)
@@ -99,19 +113,15 @@ def is_api_running():
 
 
 def start_api_server():
-    """Start the FastAPI server in the background with visible error logging."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
     log_path = os.path.join(script_dir, "wispr_api.log")
-
-    # Log file for API errors (so we can show them if it fails)
     log_file = open(log_path, "w", encoding="utf-8")
 
-    # Start uvicorn as a subprocess
     startupinfo = None
     if os.name == 'nt':
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startupinfo.wShowWindow = 0  # SW_HIDE
+        startupinfo.wShowWindow = 0
 
     proc = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "src.main:app",
@@ -125,34 +135,89 @@ def start_api_server():
 
 
 def show_api_errors(log_path):
-    """Show the last lines of the API log file if it failed to start."""
     try:
         if os.path.exists(log_path):
             with open(log_path, "r", encoding="utf-8", errors="replace") as f:
                 lines = f.readlines()
             if lines:
                 print()
-                print("  --- Ultimas lineas del log de la API ---")
+                print("  --- Log de la API ---")
                 for line in lines[-15:]:
                     print(f"  {line.rstrip()}")
-                print("  --- Fin del log ---")
-                print()
+                print("  --- Fin ---")
     except Exception:
         pass
 
 
 # ============================================================
-# HOTKEY (Windows RegisterHotKey - official & bulletproof)
+# AUDIO MUTER (mute system audio during recording)
+# ============================================================
+class AudioMuter:
+    """
+    Mute/unmute system audio during recording.
+    Uses pycaw (Windows Core Audio API) if available.
+    Falls back to VK_VOLUME_MUTE keypress if not.
+    """
+
+    def __init__(self):
+        self._was_muted = False
+        self._endpoint = None
+        self._use_pycaw = False
+        self._init()
+
+    def _init(self):
+        try:
+            from ctypes import cast, POINTER
+            from comtypes import CLSCTX_ALL
+            from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+
+            devices = AudioUtilities.GetSpeakers()
+            interface = devices.Activate(
+                IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+            self._endpoint = cast(interface, POINTER(IAudioEndpointVolume))
+            self._use_pycaw = True
+        except Exception:
+            self._use_pycaw = False
+
+    def mute(self):
+        if self._use_pycaw and self._endpoint:
+            try:
+                self._was_muted = bool(self._endpoint.GetMute())
+                if not self._was_muted:
+                    self._endpoint.SetMute(1, None)
+            except Exception:
+                pass
+        else:
+            # Fallback: simulate mute key
+            self._was_muted = False
+            user32.keybd_event(0xAD, 0, 0, 0)
+            user32.keybd_event(0xAD, 0, 0x0002, 0)
+
+    def unmute(self):
+        if self._use_pycaw and self._endpoint:
+            try:
+                if not self._was_muted:
+                    self._endpoint.SetMute(0, None)
+            except Exception:
+                pass
+        else:
+            if not self._was_muted:
+                user32.keybd_event(0xAD, 0, 0, 0)
+                user32.keybd_event(0xAD, 0, 0x0002, 0)
+
+
+# ============================================================
+# PUSH-TO-TALK HOTKEY (RegisterHotKey + GetAsyncKeyState)
 # ============================================================
 class HotkeyListener:
     """
-    Uses RegisterHotKey API to capture Ctrl+Space system-wide.
-    This is the same API used by Discord, OBS, Spotify, etc.
-    100% reliable, no admin required.
+    Push-to-talk: RegisterHotKey detects Ctrl+Space DOWN,
+    then polls GetAsyncKeyState to detect release.
     """
 
-    def __init__(self, callback):
-        self.callback = callback
+    def __init__(self, on_press, on_release):
+        self.on_press = on_press
+        self.on_release = on_release
         self._running = True
         self.registered = False
 
@@ -162,28 +227,37 @@ class HotkeyListener:
         return thread
 
     def _run(self):
-        # Register Ctrl+Space
-        ok = user32.RegisterHotKey(None, HOTKEY_ID, MOD_CONTROL | MOD_NOREPEAT, VK_SPACE)
+        ok = user32.RegisterHotKey(
+            None, HOTKEY_ID, MOD_CONTROL | MOD_NOREPEAT, VK_SPACE)
         if not ok:
             print("  [X] ERROR: No se pudo registrar Ctrl+Space")
             print("      Puede que otra app ya lo este usando.")
-            print("      Cerrala e intenta de nuevo.")
             return
 
         self.registered = True
-        print("  [OK] Hotkey Ctrl+Space registrado!")
+        print("  [OK] Hotkey Ctrl+Space registrado (push-to-talk)")
 
-        # Message pump - wait for hotkey events
         msg = wintypes.MSG()
         while self._running:
             ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
             if ret <= 0:
                 break
-            if msg.message == 0x0312:  # WM_HOTKEY
-                if msg.wParam == HOTKEY_ID:
-                    threading.Thread(target=self.callback, daemon=True).start()
+            if msg.message == 0x0312 and msg.wParam == HOTKEY_ID:
+                threading.Thread(target=self.on_press, daemon=True).start()
+                threading.Thread(target=self._poll_release, daemon=True).start()
 
         user32.UnregisterHotKey(None, HOTKEY_ID)
+
+    def _poll_release(self):
+        """Poll until Ctrl or Space is released."""
+        time.sleep(0.15)  # avoid false positive on fast key processing
+        while self._running:
+            ctrl = GetAsyncKeyState(VK_CONTROL) & 0x8000
+            space = GetAsyncKeyState(VK_SPACE) & 0x8000
+            if not ctrl or not space:
+                threading.Thread(target=self.on_release, daemon=True).start()
+                return
+            time.sleep(0.04)  # 40ms poll
 
     def stop(self):
         self._running = False
@@ -229,7 +303,7 @@ class SoundManager:
 
 
 # ============================================================
-# UI OVERLAY (Siri orb, click-through, never steals focus)
+# OVERLAY (Siri orb, click-through, never steals focus)
 # ============================================================
 class Overlay:
     def __init__(self):
@@ -379,7 +453,6 @@ class Overlay:
         self.q.put(("hide", None))
 
     def run(self):
-        # Brief startup flash
         self.root.attributes("-alpha", 1.0)
         self._clear()
         c = self.sz / 2
@@ -390,49 +463,54 @@ class Overlay:
 
 
 # ============================================================
-# CORE - Recording + Transcription + Auto-paste
+# CORE - Push-to-Talk Recording + Streaming + Auto-paste
 # ============================================================
 class Wispr:
     def __init__(self, overlay):
         self.ui = overlay
         self.recording = False
-        self.buf = []
         self.stream = None
         self._lock = threading.Lock()
+        self._chunk_queue = queue.Queue()
+        self._muter = AudioMuter()
 
-    def toggle(self):
-        if self.recording:
-            self._stop()
-        else:
-            self._start()
-
-    def _start(self):
+    def start_recording(self):
+        """Called on Ctrl+Space key DOWN (push-to-talk start)."""
         with self._lock:
             if self.recording:
                 return
-            print("  [>>] Grabando... (habla ahora)")
             SoundManager.start()
+            time.sleep(0.12)  # let beep play before muting
+            self._muter.mute()
+            print("  [>>] Grabando... (mantene Ctrl+Space)")
             self.ui.show()
             self.recording = True
-            self.buf = []
+            self._chunk_queue = queue.Queue()
+
             try:
+                blocksize = int(SAMPLE_RATE * CHUNK_DURATION)
                 self.stream = sd.InputStream(
                     samplerate=SAMPLE_RATE, channels=CHANNELS,
-                    dtype='float32', callback=self._cb)
+                    dtype='float32', blocksize=blocksize,
+                    callback=self._audio_cb)
                 self.stream.start()
             except Exception as e:
                 print(f"  [!] Error de microfono: {e}")
                 self.recording = False
+                self._muter.unmute()
                 self.ui.hide()
                 SoundManager.error()
+                return
 
-    def _stop(self):
+            # Start WebSocket streaming thread
+            threading.Thread(target=self._stream_sender, daemon=True).start()
+
+    def stop_recording(self):
+        """Called on Ctrl+Space key RELEASE (push-to-talk stop)."""
         with self._lock:
             if not self.recording:
                 return
-            print("  [||] Procesando audio...")
-            SoundManager.stop()
-            self.ui.state("spin")
+            print("  [||] Procesando...")
             self.recording = False
             if self.stream:
                 try:
@@ -441,17 +519,22 @@ class Wispr:
                 except Exception:
                     pass
                 self.stream = None
-            chunks = list(self.buf)
-            self.buf = []
-        threading.Thread(target=self._send, args=(chunks,), daemon=True).start()
+            self._muter.unmute()
+            SoundManager.stop()
+            self.ui.state("spin")
+            # Signal streaming thread that recording is done
+            self._chunk_queue.put(None)
 
-    def _cb(self, indata, frames, t, status):
+    def _audio_cb(self, indata, frames, t, status):
+        """Sounddevice callback - converts float32 to int16 PCM bytes."""
         if self.recording:
-            self.buf.append(indata.copy())
+            pcm = (indata.copy() * 32767).astype(np.int16)
+            self._chunk_queue.put(pcm.tobytes())
 
-    def _send(self, chunks):
+    def _stream_sender(self):
+        """Background thread: streams audio chunks over WebSocket."""
         try:
-            asyncio.run(self._async_send(chunks))
+            asyncio.run(self._async_stream())
         except Exception as e:
             print(f"  [!] Error: {e}")
             self.ui.state("err")
@@ -459,47 +542,65 @@ class Wispr:
             time.sleep(1.5)
             self.ui.hide()
 
-    async def _async_send(self, chunks):
-        if not chunks:
-            self.ui.hide()
-            return
-
-        audio = np.concatenate(chunks, axis=0)
-        dur = len(audio) / SAMPLE_RATE
-        if dur < 0.3:
-            print(f"  [!] Muy corto ({dur:.1f}s)")
-            self.ui.hide()
-            return
-
-        print(f"  [~] {dur:.1f}s de audio")
-        pcm = (audio * 32767).astype(np.int16)
-        wav = io.BytesIO()
-        write_wav(wav, SAMPLE_RATE, pcm)
-        data = wav.getvalue()
-
+    async def _async_stream(self):
         sid = str(uuid.uuid4())
-        uri = f"{API_URL}/{sid}?auto_type=true"
+        uri = f"{API_URL}/{sid}?auto_type=true&streaming=true"
+        total_bytes = 0
+        chunk_count = 0
 
         try:
-            async with websockets.connect(uri, ping_timeout=60, close_timeout=5) as ws:
-                await ws.send(data)
-                print(f"  [>] Enviado {len(data)} bytes")
+            async with websockets.connect(
+                uri, ping_timeout=60, close_timeout=10
+            ) as ws:
+                while True:
+                    try:
+                        chunk = await asyncio.wait_for(
+                            asyncio.to_thread(self._chunk_queue.get, timeout=0.2),
+                            timeout=0.5
+                        )
+                    except (asyncio.TimeoutError, Exception):
+                        # No chunk available yet, keep waiting
+                        if not self.recording and self._chunk_queue.empty():
+                            # Recording stopped and queue drained
+                            await ws.send(b"DONE")
+                            break
+                        continue
+
+                    if chunk is None:
+                        # Sentinel: recording stopped
+                        await ws.send(b"DONE")
+                        break
+
+                    await ws.send(chunk)
+                    chunk_count += 1
+                    total_bytes += len(chunk)
+
+                # Check minimum audio
+                duration = total_bytes / (SAMPLE_RATE * 2)  # 16-bit = 2 bytes/sample
+                if duration < 0.3:
+                    print(f"  [!] Muy corto ({duration:.1f}s)")
+                    self.ui.hide()
+                    return
+
+                print(f"  [~] {duration:.1f}s ({chunk_count} chunks enviados)")
+
+                # Wait for transcript
                 resp = await asyncio.wait_for(ws.recv(), timeout=30)
-                print(f"  [<] {resp[:150]}")
+                print(f"  [<] {resp[:200]}")
 
                 self.ui.state("ok")
                 SoundManager.success()
-                await asyncio.sleep(0.7)
+                await asyncio.sleep(0.5)
                 self.ui.hide()
 
         except asyncio.TimeoutError:
-            print("  [!] Timeout esperando transcripcion")
+            print("  [!] Timeout")
             self.ui.state("err")
             SoundManager.error()
             await asyncio.sleep(1.5)
             self.ui.hide()
         except Exception as e:
-            print(f"  [!] Error de conexion: {e}")
+            print(f"  [!] {e}")
             self.ui.state("err")
             SoundManager.error()
             await asyncio.sleep(1.5)
@@ -520,20 +621,24 @@ def main():
     print()
 
     # --- Step 1: Dependencies ---
-    print("  [1/3] Verificando dependencias...")
-    print("  [OK] Todas las dependencias instaladas")
-    print()
+    print("  [1/4] Dependencias OK")
 
-    # --- Step 2: Auto-start API ---
-    print("  [2/3] Verificando API server...")
+    # --- Step 2: Audio muter ---
+    muter = AudioMuter()
+    if muter._use_pycaw:
+        print("  [2/4] Mute automatico activado (pycaw)")
+    else:
+        print("  [2/4] Mute automatico: modo basico (instala pycaw para mejor)")
+
+    # --- Step 3: Auto-start API ---
+    print("  [3/4] Verificando API server...")
     api_proc = None
     log_path = None
     if is_api_running():
-        print("  [OK] API ya esta corriendo en puerto 8000")
+        print("  [OK] API corriendo en puerto 8000")
     else:
         print("  [..] Arrancando API server...")
         api_proc, log_path = start_api_server()
-        # Wait for it
         for i in range(20):
             time.sleep(1)
             if is_api_running():
@@ -541,53 +646,46 @@ def main():
             if i < 5:
                 print(f"       Esperando... ({i+1}s)")
         if is_api_running():
-            print("  [OK] API lista en puerto 8000")
+            print("  [OK] API lista!")
         else:
-            print("  [!] API no arranco despues de 20 segundos")
+            print("  [!] API no arranco")
             if log_path:
                 show_api_errors(log_path)
-            print("  [!] Ejecuta manualmente:")
             print("      python -m uvicorn src.main:app --port 8000")
-            print()
-            print("  El dictado NO funcionara sin la API.")
-            print()
-    print()
 
-    # --- Step 3: Hotkey ---
-    print("  [3/3] Registrando hotkey...")
+    # --- Step 4: Hotkey ---
+    print("  [4/4] Registrando hotkey...")
     overlay = Overlay()
     wispr = Wispr(overlay)
-    hotkey = HotkeyListener(callback=wispr.toggle)
+    hotkey = HotkeyListener(
+        on_press=wispr.start_recording,
+        on_release=wispr.stop_recording,
+    )
     hotkey.start()
-
-    # Wait a moment for hotkey registration
     time.sleep(0.5)
 
     print()
     print("  ==========================================")
     if hotkey.registered:
-        print("     LISTO! Ya podes dictar por voz")
+        print("      LISTO! Push-to-Talk activo")
     else:
-        print("     ERROR: Hotkey no se pudo registrar")
+        print("      ERROR: Hotkey no se registro")
     print("  ==========================================")
     print()
     print("  COMO USAR:")
     print("  1. Clickea en cualquier campo de texto")
-    print("     (Chrome, Word, WhatsApp Web, VS Code, etc)")
-    print("  2. Presiona  Ctrl + Espacio")
-    print("  3. Habla (vas a ver un circulo animado)")
-    print("  4. Presiona  Ctrl + Espacio  de nuevo")
-    print("  5. El texto se pega automaticamente!")
+    print("  2. MANTENE presionado  Ctrl + Espacio")
+    print("  3. Habla mientras mantenes presionado")
+    print("  4. SOLTA para transcribir y pegar!")
     print()
-    print("  Podes minimizar esta ventana.")
-    print("  NO la cierres o se desactiva el dictado.")
+    print("  La musica se mutea al grabar.")
+    print("  Minimiza esta ventana (no la cierres).")
     print()
     print("  ------------------------------------------")
     print("  Esperando Ctrl+Space...")
     print("  ------------------------------------------")
     print()
 
-    # --- Run UI loop ---
     try:
         overlay.run()
     except KeyboardInterrupt:

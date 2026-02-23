@@ -5,7 +5,7 @@ echo  ==========================================
 echo     INSTALANDO DEPENDENCIAS
 echo  ==========================================
 echo.
-pip install sounddevice numpy scipy websockets pyautogui pyperclip
+pip install sounddevice numpy scipy websockets pyautogui pyperclip pycaw comtypes
 echo.
 echo  ==========================================
 echo     INSTALACION COMPLETA
